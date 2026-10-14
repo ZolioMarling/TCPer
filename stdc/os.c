@@ -1,4 +1,19 @@
+#if defined(_WIN32) && !defined(_CRT_RAND_S)
+    #define _CRT_RAND_S
+#endif
+
 #include "os.h"
+
+#include <ctype.h>
+
+#if defined(__OS_WINDOWS__)
+    #include <aclapi.h>
+    #include <fcntl.h>
+#endif
+
+#if defined(__OS_UNIX__)
+_Static_assert(sizeof(off_t) >= sizeof(int64), "TCPer requires 64-bit file offsets");
+#endif
 
 
 static volatile unsigned long long OS_SEED = 1;
@@ -23,7 +38,8 @@ int os_access(char *path) {
         DWORD attrs = GetFileAttributesA(path);
         if (attrs != INVALID_FILE_ATTRIBUTES) return 1;
         DWORD error = GetLastError();
-        return (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND || error == ERROR_INVALID_NAME) ? 0 : -1;
+        return (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND ||
+            error == ERROR_INVALID_NAME) ? 0 : -1;
     #endif
 }
 
@@ -34,7 +50,7 @@ char *os_readfile(char *path, int range_start, int range_end) {
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
 
-    int64 file_size = os_stream_size(f);
+    int64 file_size = os_file_size(f);
     if (file_size < 0) {
         fclose(f);
         return NULL;
@@ -43,7 +59,8 @@ char *os_readfile(char *path, int range_start, int range_end) {
     int64 length;
     if (range_start == 0 && range_end == -1) length = file_size;
     else {
-        if (range_start < 0 || range_end < range_start || os_fseek(f, (int64)range_start, SEEK_SET) != 0) {
+        if (range_start < 0 || range_end < range_start ||
+            os_fseek(f, (int64)range_start, SEEK_SET) != 0) {
             fclose(f);
             return NULL;
         }
@@ -57,7 +74,7 @@ char *os_readfile(char *path, int range_start, int range_end) {
         return NULL;
     }
     usize capacity = (usize)length + 1;
-    char *buffer = malloc(capacity * sizeof(*buffer));
+    char *buffer = malloc(capacity);
     if (!buffer) {
         fclose(f);
         return NULL;
@@ -139,6 +156,7 @@ int os_isdir(char *path) {
 
 int os_isfile(char *path) {
     if (path == NULL || *path == '\0') return 0;
+
     #if defined(__OS_UNIX__)
         struct stat s;
         return stat(path, &s) == 0 && S_ISREG(s.st_mode);
@@ -165,33 +183,21 @@ int os_mkdir(char *dir) {
 }
 
 
-FILE *os_fopen_private_write(char *path) {
+FILE *os_fopen_private_write(const char *path) {
     if (!path || !path[0]) return NULL;
-
     #if defined(__OS_UNIX__)
         int flags = O_WRONLY | O_CREAT;
-
         #ifdef O_NOFOLLOW
-            flags = flags | O_NOFOLLOW;
+            flags |= O_NOFOLLOW;
         #endif
-
         int descriptor = open(path, flags, S_IRUSR | S_IWUSR);
         if (descriptor < 0) return NULL;
-    
         struct stat status;
-        if (
-            fstat(descriptor, &status) != 0
-            ||
-            !S_ISREG(status.st_mode)
-            ||
-            fchmod(descriptor, S_IRUSR | S_IWUSR) != 0
-            ||
-            ftruncate(descriptor, 0) != 0
-        ) {
+        if (fstat(descriptor, &status) != 0 || !S_ISREG(status.st_mode) ||
+            fchmod(descriptor, S_IRUSR | S_IWUSR) != 0 || ftruncate(descriptor, 0) != 0) {
             close(descriptor);
             return NULL;
         }
-
         FILE *file = fdopen(descriptor, "w");
         if (!file) close(descriptor);
         return file;
@@ -206,64 +212,39 @@ FILE *os_fopen_private_write(char *path) {
         if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) goto cleanup;
         GetTokenInformation(token, TokenUser, NULL, 0, &information_size);
         if (GetLastError() != ERROR_INSUFFICIENT_BUFFER) goto cleanup;
-
         user = (TOKEN_USER *)malloc(information_size);
-        if (!user || !GetTokenInformation(token, TokenUser, user, information_size, &information_size)) goto cleanup;
+        if (!user || !GetTokenInformation(token, TokenUser, user, information_size,
+                                          &information_size)) goto cleanup;
 
-        DWORD acl_size = sizeof(ACL) + sizeof(ACCESS_ALLOWED_ACE) - sizeof(DWORD) + GetLengthSid(user->User.Sid);
+        DWORD acl_size = sizeof(ACL) + sizeof(ACCESS_ALLOWED_ACE) - sizeof(DWORD) +
+            GetLengthSid(user->User.Sid);
         acl = (ACL *)malloc(acl_size);
-
-        if (
-            !acl
-            ||
-            !InitializeAcl(acl, acl_size, ACL_REVISION)
-            ||
-            !AddAccessAllowedAce(acl, ACL_REVISION, FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE, user->User.Sid)
-        ) goto cleanup;
+        if (!acl || !InitializeAcl(acl, acl_size, ACL_REVISION) ||
+            !AddAccessAllowedAce(acl, ACL_REVISION,
+                                 FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE,
+                                 user->User.Sid)) goto cleanup;
 
         SECURITY_DESCRIPTOR security;
-        if (
-            !InitializeSecurityDescriptor(&security, SECURITY_DESCRIPTOR_REVISION)
-            ||
-            !SetSecurityDescriptorDacl(&security, TRUE, acl, FALSE)
-        ) goto cleanup;
-
+        if (!InitializeSecurityDescriptor(&security, SECURITY_DESCRIPTOR_REVISION) ||
+            !SetSecurityDescriptorDacl(&security, TRUE, acl, FALSE)) goto cleanup;
         SECURITY_ATTRIBUTES attributes = {
             .nLength = sizeof(attributes),
             .lpSecurityDescriptor = &security,
             .bInheritHandle = FALSE
         };
-        handle = CreateFileA(
-            path,
-            GENERIC_WRITE | READ_CONTROL | WRITE_DAC,
-            0,
-            &attributes,
-            OPEN_ALWAYS,
-            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
-            NULL
-        );
+        handle = CreateFileA(path, GENERIC_WRITE | READ_CONTROL | WRITE_DAC, 0, &attributes,
+                             OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+                             NULL);
         if (handle == INVALID_HANDLE_VALUE) goto cleanup;
 
         BY_HANDLE_FILE_INFORMATION information;
-        if (
-            !GetFileInformationByHandle(handle, &information)
-            ||
-            (information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
-            ||
-            SetSecurityInfo(
-                handle,
-                SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                NULL,
-                NULL,
-                acl,
-                NULL
-            ) != ERROR_SUCCESS
-            ||
-            SetFilePointer(handle, 0, NULL, FILE_BEGIN) == INVALID_SET_FILE_POINTER
-            ||
-            !SetEndOfFile(handle)
-        ) goto cleanup;
+        if (!GetFileInformationByHandle(handle, &information) ||
+            (information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) ||
+            SetSecurityInfo(handle, SE_FILE_OBJECT,
+                            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                            NULL, NULL, acl, NULL) != ERROR_SUCCESS ||
+            SetFilePointer(handle, 0, NULL, FILE_BEGIN) == INVALID_SET_FILE_POINTER ||
+            !SetEndOfFile(handle)) goto cleanup;
 
         int descriptor = _open_osfhandle((intptr_t)handle, _O_WRONLY | _O_BINARY);
         if (descriptor < 0) goto cleanup;
@@ -281,14 +262,14 @@ FILE *os_fopen_private_write(char *path) {
 }
 
 
-int os_canonical_path(char *output, usize capacity, char *path) {
+int os_canonical_path(char *output, usize capacity, const char *path) {
     if (!output || capacity == 0 || !path || !path[0]) return 1;
 
     char work[4096];
     int n = snprintf(work, sizeof(work), "%s", path);
     if (n < 0 || n >= (int)sizeof(work)) return 1;
 
-    // Resolve the final component when it exists, including symlink/junction aliases.
+    /* Resolve the final component when it exists, including symlink/junction aliases. */
     #if defined(__OS_UNIX__)
         char *existing = realpath(path, NULL);
         if (existing) {
@@ -298,18 +279,13 @@ int os_canonical_path(char *output, usize capacity, char *path) {
         }
         if (errno != ENOENT && errno != ENOTDIR) return 1;
     #elif defined(__OS_WINDOWS__)
-        HANDLE existing = CreateFileA(
-            path,
-            0,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            NULL,
-            OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS,
-            NULL
-        );
+        HANDLE existing = CreateFileA(path, 0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS, NULL);
         if (existing != INVALID_HANDLE_VALUE) {
             char resolved[4096];
-            DWORD length = GetFinalPathNameByHandleA(existing, resolved, (DWORD)sizeof(resolved), FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+            DWORD length = GetFinalPathNameByHandleA(existing, resolved,
+                (DWORD)sizeof(resolved), FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
             CloseHandle(existing);
             if (length == 0 || length >= sizeof(resolved)) return 1;
             char *canonical = strncmp(resolved, "\\\\?\\", 4) == 0 ? resolved + 4 : resolved;
@@ -321,7 +297,8 @@ int os_canonical_path(char *output, usize capacity, char *path) {
             return n < 0 || n >= (int)capacity ? 1 : 0;
         }
         DWORD error = GetLastError();
-        if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND && error != ERROR_INVALID_NAME) return 1;
+        if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND &&
+            error != ERROR_INVALID_NAME) return 1;
     #endif
 
     #if defined(__OS_UNIX__)
@@ -346,7 +323,9 @@ int os_canonical_path(char *output, usize capacity, char *path) {
         if (parent_length >= sizeof(parent)) return 1;
         memcpy(parent, work, parent_length);
         parent[parent_length] = '\0';
-    } else snprintf(parent, sizeof(parent), ".");
+    } else {
+        snprintf(parent, sizeof(parent), ".");
+    }
 
     #if defined(__OS_UNIX__)
         char *resolved = realpath(parent, NULL);
@@ -363,13 +342,13 @@ int os_canonical_path(char *output, usize capacity, char *path) {
         for (char *p = base; *p; p++) *p = (char)tolower((unsigned char)*p);
         n = snprintf(output, capacity, "%s/%s", resolved, base);
     #endif
-
     return n < 0 || n >= (int)capacity ? 1 : 0;
 }
 
 
-int os_transfer_lock_path(char *output, usize capacity, char *lock_id) {
-    if (!output || capacity == 0 || !lock_id || strlen(lock_id) != 64 || strspn(lock_id, "0123456789abcdefABCDEF") != 64) return 1;
+int os_transfer_lock_path(char *output, usize capacity, const char *lock_id) {
+    if (!output || capacity == 0 || !lock_id || strlen(lock_id) != 64 ||
+        strspn(lock_id, "0123456789abcdefABCDEF") != 64) return 1;
 
     char directory[4096];
     #if defined(__OS_UNIX__)
@@ -377,17 +356,8 @@ int os_transfer_lock_path(char *output, usize capacity, char *lock_id) {
         if (n < 0 || n >= (int)sizeof(directory)) return 1;
         if (mkdir(directory, 0700) != 0 && errno != EEXIST) return 1;
         struct stat st;
-        if (
-            lstat(directory, &st) != 0
-            ||
-            !S_ISDIR(st.st_mode)
-            ||
-            S_ISLNK(st.st_mode)
-            ||
-            st.st_uid != getuid()
-            ||
-            (st.st_mode & 077) != 0
-        ) return 1;
+        if (lstat(directory, &st) != 0 || !S_ISDIR(st.st_mode) || S_ISLNK(st.st_mode) ||
+            st.st_uid != getuid() || (st.st_mode & 077) != 0) return 1;
     #elif defined(__OS_WINDOWS__)
         DWORD length = GetTempPathA((DWORD)sizeof(directory), directory);
         if (length == 0 || length >= sizeof(directory)) return 1;
@@ -395,7 +365,8 @@ int os_transfer_lock_path(char *output, usize capacity, char *lock_id) {
         if (n < 0 || n >= (int)(sizeof(directory) - length)) return 1;
         if (!CreateDirectoryA(directory, NULL) && GetLastError() != ERROR_ALREADY_EXISTS) return 1;
         DWORD attrs = GetFileAttributesA(directory);
-        if (attrs == INVALID_FILE_ATTRIBUTES || !(attrs & FILE_ATTRIBUTE_DIRECTORY) || (attrs & FILE_ATTRIBUTE_REPARSE_POINT)) return 1;
+        if (attrs == INVALID_FILE_ATTRIBUTES || !(attrs & FILE_ATTRIBUTE_DIRECTORY) ||
+            (attrs & FILE_ATTRIBUTE_REPARSE_POINT)) return 1;
     #endif
 
     int result = snprintf(output, capacity, "%s/%s.lock", directory, lock_id);
@@ -403,7 +374,7 @@ int os_transfer_lock_path(char *output, usize capacity, char *lock_id) {
 }
 
 
-int os_path_lock(_PathLock *lock, char *path) {
+int os_path_lock(PathLock *lock, const char *path) {
     if (!lock || !path || !path[0]) return 1;
     memset(lock, 0, sizeof(*lock));
 
@@ -418,15 +389,8 @@ int os_path_lock(_PathLock *lock, char *path) {
 
             struct stat opened;
             struct stat current;
-            if (
-                fstat(fileno(file), &opened) == 0
-                &&
-                lstat(path, &current) == 0
-                &&
-                opened.st_dev == current.st_dev
-                &&
-                opened.st_ino == current.st_ino
-            ) {
+            if (fstat(fileno(file), &opened) == 0 && lstat(path, &current) == 0 &&
+                opened.st_dev == current.st_dev && opened.st_ino == current.st_ino) {
                 lock->path = strdup(path);
                 if (!lock->path) {
                     fclose(file);
@@ -459,23 +423,15 @@ int os_path_lock(_PathLock *lock, char *path) {
 }
 
 
-void os_path_unlock(_PathLock *lock) {
+void os_path_unlock(PathLock *lock) {
     if (!lock) return;
     #if defined(__OS_UNIX__)
         if (lock->file) {
             struct stat opened;
             struct stat current;
-            if (
-                lock->path
-                &&
-                fstat(fileno(lock->file), &opened) == 0
-                &&
-                lstat(lock->path, &current) == 0
-                &&
-                opened.st_dev == current.st_dev
-                &&
-                opened.st_ino == current.st_ino
-            ) remove(lock->path);
+            if (lock->path && fstat(fileno(lock->file), &opened) == 0 &&
+                lstat(lock->path, &current) == 0 && opened.st_dev == current.st_dev &&
+                opened.st_ino == current.st_ino) remove(lock->path);
             fclose(lock->file);
         }
         free(lock->path);
@@ -490,8 +446,7 @@ void os_path_unlock(_PathLock *lock) {
     #endif
 }
 
-
-int os_path_rwlock(_PathRWLock *lock, char *path, int exclusive) {
+int os_path_rwlock(PathRWLock *lock, const char *path, int exclusive) {
     if (!lock || !path || !path[0]) return 1;
     memset(lock, 0, sizeof(*lock));
 
@@ -507,15 +462,9 @@ int os_path_rwlock(_PathRWLock *lock, char *path, int exclusive) {
         lock->file = file;
         return 0;
     #elif defined(__OS_WINDOWS__)
-        HANDLE handle = CreateFileA(
-            path,
-            GENERIC_READ | GENERIC_WRITE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            NULL,
-            OPEN_ALWAYS,
-            FILE_ATTRIBUTE_HIDDEN,
-            NULL
-        );
+        HANDLE handle = CreateFileA(path, GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_ALWAYS,
+            FILE_ATTRIBUTE_HIDDEN, NULL);
         if (handle == INVALID_HANDLE_VALUE) return 1;
         DWORD flags = exclusive ? LOCKFILE_EXCLUSIVE_LOCK : 0;
         if (!LockFileEx(handle, flags, 0, MAXDWORD, MAXDWORD, &lock->overlap)) {
@@ -529,7 +478,7 @@ int os_path_rwlock(_PathRWLock *lock, char *path, int exclusive) {
 }
 
 
-void os_path_rwunlock(_PathRWLock *lock) {
+void os_path_rwunlock(PathRWLock *lock) {
     if (!lock) return;
     #if defined(__OS_UNIX__)
         if (lock->file) fclose(lock->file);
@@ -602,53 +551,26 @@ double os_random(double low, double high) {
 
 
 int os_random_bytes(void *buffer, usize length) {
-    if (length == 0) return 0;
-    if (!buffer) return 1;
-
+    if (!buffer && length > 0) return 1;
     #if defined(__OS_UNIX__)
-        int flags = O_RDONLY;
-        #ifdef O_CLOEXEC
-            flags = flags | O_CLOEXEC;
-        #endif
-
-        int descriptor;
-        do descriptor = open("/dev/urandom", flags);
-        while (descriptor < 0 && errno == EINTR);
-        if (descriptor < 0) return 1;
-
-        byte *position = (byte *)buffer;
-        usize remaining = length;
-        while (remaining > 0) {
-            usize chunk = remaining > (usize)SSIZE_MAX ? (usize)SSIZE_MAX : remaining;
-            ssize_t count = read(descriptor, position, chunk);
-            if (count > 0) {
-                position = position + (usize)count;
-                remaining = remaining - (usize)count;
-                continue;
-            }
-            if (count < 0 && errno == EINTR) continue;
-            close(descriptor);
-            return 1;
-        }
-
-        close(descriptor);
-        return 0;
+        FILE *fp = fopen("/dev/urandom", "rb");
+        if (!fp) return 1;
+        usize n = fread(buffer, 1, length, fp);
+        fclose(fp);
+        return n == length ? 0 : 1;
     #elif defined(__OS_WINDOWS__)
-        byte *position = (byte *)buffer;
-        usize remaining = length;
-        while (remaining > 0) {
-            ULONG chunk = remaining > (usize)UINT32_MAX ? UINT32_MAX : (ULONG)remaining;
-            if (BCryptGenRandom(NULL, (PUCHAR)position, chunk, BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) return 1;
-            position = position + chunk;
-            remaining = remaining - chunk;
+        byte *p = (byte *)buffer;
+        for (usize i = 0; i < length; i++) {
+            unsigned int value;
+            if (rand_s(&value) != 0) return 1;
+            p[i] = (byte)value;
         }
         return 0;
     #endif
 }
 
 
-int64 os_file_size(char *filepath) {
-    if (!filepath) return -1;
+int64 os_filesize(char *filepath) {
     #if defined(__OS_UNIX__)
         struct stat file;
         if (stat(filepath, &file) == -1) return -1;
@@ -661,133 +583,44 @@ int64 os_file_size(char *filepath) {
 }
 
 
-int64 os_stream_size(FILE *stream) {
-    if (!stream) return -1;
+int64 os_file_size(FILE *file) {
+    if (!file) return -1;
     #if defined(__OS_UNIX__)
         struct stat status;
-        if (fstat(fileno(stream), &status) != 0 || !S_ISREG(status.st_mode)) return -1;
+        if (fstat(fileno(file), &status) != 0 || !S_ISREG(status.st_mode)) return -1;
         return (int64)status.st_size;
     #elif defined(__OS_WINDOWS__)
         struct _stat64 status;
-        if (_fstat64(_fileno(stream), &status) != 0 || (status.st_mode & _S_IFMT) != _S_IFREG) return -1;
+        if (_fstat64(_fileno(file), &status) != 0 ||
+            (status.st_mode & _S_IFMT) != _S_IFREG) return -1;
         return (int64)status.st_size;
     #endif
 }
 
 
-int os_stream_matches_path(FILE *stream, char *path) {
-    if (!stream || !path) return 0;
+int os_file_is_path(FILE *file, const char *path) {
+    if (!file || !path) return 0;
     #if defined(__OS_UNIX__)
         struct stat opened;
         struct stat current;
-        return (
-            fstat(fileno(stream), &opened) == 0
-            &&
-            stat(path, &current) == 0
-            &&
-            opened.st_dev == current.st_dev
-            &&
-            opened.st_ino == current.st_ino
-        );
+        return fstat(fileno(file), &opened) == 0 && stat(path, &current) == 0 &&
+            opened.st_dev == current.st_dev && opened.st_ino == current.st_ino;
     #elif defined(__OS_WINDOWS__)
-        intptr_t descriptor = _get_osfhandle(_fileno(stream));
+        intptr_t descriptor = _get_osfhandle(_fileno(file));
         if (descriptor == -1) return 0;
-        HANDLE current = CreateFileA(
-            path,
-            0,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            NULL,
-            OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL,
-            NULL
-        );
+        HANDLE current = CreateFileA(path, 0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL, NULL);
         if (current == INVALID_HANDLE_VALUE) return 0;
         BY_HANDLE_FILE_INFORMATION opened_info;
         BY_HANDLE_FILE_INFORMATION current_info;
-        int same = (
-            GetFileInformationByHandle((HANDLE)descriptor, &opened_info)
-            &&
-            GetFileInformationByHandle(current, &current_info)
-            &&
-            opened_info.dwVolumeSerialNumber == current_info.dwVolumeSerialNumber
-            &&
-            opened_info.nFileIndexHigh == current_info.nFileIndexHigh
-            &&
-            opened_info.nFileIndexLow == current_info.nFileIndexLow
-        );
+        int same = GetFileInformationByHandle((HANDLE)descriptor, &opened_info) &&
+            GetFileInformationByHandle(current, &current_info) &&
+            opened_info.dwVolumeSerialNumber == current_info.dwVolumeSerialNumber &&
+            opened_info.nFileIndexHigh == current_info.nFileIndexHigh &&
+            opened_info.nFileIndexLow == current_info.nFileIndexLow;
         CloseHandle(current);
         return same;
-    #endif
-}
-
-
-int os_file_lock(FILE *stream) {
-    if (!stream) return 1;
-    #if defined(__OS_UNIX__)
-        return flock(fileno(stream), LOCK_EX | LOCK_NB) == 0 ? 0 : 1;
-    #elif defined(__OS_WINDOWS__)
-        HANDLE handle = (HANDLE)_get_osfhandle(_fileno(stream));
-        if (handle == INVALID_HANDLE_VALUE) return 1;
-        OVERLAPPED overlap = {0};
-        return LockFileEx(handle, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, MAXDWORD, MAXDWORD, &overlap) ? 0 : 1;
-    #endif
-}
-
-
-int os_file_sync(FILE *stream) {
-    if (!stream || fflush(stream) != 0) return 1;
-    #if defined(__OS_UNIX__)
-        return fsync(fileno(stream)) == 0 ? 0 : 1;
-    #elif defined(__OS_WINDOWS__)
-        intptr_t descriptor = _get_osfhandle(_fileno(stream));
-        if (descriptor == -1) return 1;
-        return FlushFileBuffers((HANDLE)descriptor) ? 0 : 1;
-    #endif
-}
-
-
-int os_file_lock_wait(FILE *stream) {
-    if (!stream) return 1;
-    #if defined(__OS_UNIX__)
-        return flock(fileno(stream), LOCK_EX) == 0 ? 0 : 1;
-    #elif defined(__OS_WINDOWS__)
-        HANDLE handle = (HANDLE)_get_osfhandle(_fileno(stream));
-        if (handle == INVALID_HANDLE_VALUE) return 1;
-        OVERLAPPED overlap = {0};
-        return LockFileEx(handle, LOCKFILE_EXCLUSIVE_LOCK, 0, MAXDWORD, MAXDWORD, &overlap) ? 0 : 1;
-    #endif
-}
-
-
-void os_file_unlock(FILE *stream) {
-    if (!stream) return;
-    #if defined(__OS_UNIX__)
-        flock(fileno(stream), LOCK_UN);
-    #elif defined(__OS_WINDOWS__)
-        HANDLE handle = (HANDLE)_get_osfhandle(_fileno(stream));
-        if (handle == INVALID_HANDLE_VALUE) return;
-        OVERLAPPED overlap = {0};
-        UnlockFileEx(handle, 0, MAXDWORD, MAXDWORD, &overlap);
-    #endif
-}
-
-
-int os_rename_replace(char *source, char *destination) {
-    if (!source || !destination) return 1;
-    #if defined(__OS_UNIX__)
-        return rename(source, destination);
-    #elif defined(__OS_WINDOWS__)
-        return MoveFileExA(source, destination, MOVEFILE_REPLACE_EXISTING) ? 0 : 1;
-    #endif
-}
-
-
-int os_hardlink(char *source, char *destination) {
-    if (!source || !destination) return 1;
-    #if defined(__OS_UNIX__)
-        return link(source, destination) == 0 ? 0 : 1;
-    #elif defined(__OS_WINDOWS__)
-        return CreateHardLinkA(destination, source, NULL) ? 0 : 1;
     #endif
 }
 
@@ -829,7 +662,6 @@ MapFile *os_mmap(char *filepath, usize length) {
             return NULL;
         }
     #endif
-
     return f;
 }
 
@@ -850,7 +682,6 @@ void os_munmap(MapFile *f) {
 
 int os_listdir(char *path, _ListdirCallback func, void *args) {
     if (!path || !func) return 1;
-
     #if defined(__OS_UNIX__)
         DIR *dir = opendir(path);
         if (!dir) return 1;
@@ -930,64 +761,63 @@ bool os_traversal(char *path) {
 
 
 #if defined(__OS_UNIX__)
-    int __os_remove_directory_fd__(int directory_fd) {
-        DIR *directory = fdopendir(directory_fd);
-        if (!directory) {
-            close(directory_fd);
-            return 1;
-        }
-
-        int result = 0;
-        int parent_fd = dirfd(directory);
-        while (1) {
-            errno = 0;
-            struct dirent *entry = readdir(directory);
-            if (!entry) {
-                if (errno != 0) result = 1;
-                break;
-            }
-            const char *name = entry->d_name;
-            if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) continue;
-
-            struct stat expected;
-            if (fstatat(parent_fd, name, &expected, AT_SYMLINK_NOFOLLOW) != 0) {
-                result = 1;
-                continue;
-            }
-            if (!S_ISDIR(expected.st_mode)) {
-                if (unlinkat(parent_fd, name, 0) != 0) result = 1;
-                continue;
-            }
-
-            int flags = O_RDONLY | O_DIRECTORY;
-
-            #ifdef O_NOFOLLOW
-                flags = flags | O_NOFOLLOW;
-            #endif
-
-            int child_fd = openat(parent_fd, name, flags);
-            struct stat opened;
-            if (child_fd < 0 || fstat(child_fd, &opened) != 0 || opened.st_dev != expected.st_dev || opened.st_ino != expected.st_ino) {
-                if (child_fd >= 0) close(child_fd);
-                result = 1;
-                continue;
-            }
-            if (__os_remove_directory_fd__(child_fd) != 0 || unlinkat(parent_fd, name, AT_REMOVEDIR) != 0) result = 1;
-        }
-        if (closedir(directory) != 0) result = 1;
-        return result;
+static int __os_remove_directory_fd__(int directory_fd) {
+    DIR *directory = fdopendir(directory_fd);
+    if (!directory) {
+        close(directory_fd);
+        return 1;
     }
+
+    int result = 0;
+    int parent_fd = dirfd(directory);
+    while (1) {
+        errno = 0;
+        struct dirent *entry = readdir(directory);
+        if (!entry) {
+            if (errno != 0) result = 1;
+            break;
+        }
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+            continue;
+
+        struct stat expected;
+        if (fstatat(parent_fd, entry->d_name, &expected, AT_SYMLINK_NOFOLLOW) != 0) {
+            result = 1;
+            continue;
+        }
+        if (!S_ISDIR(expected.st_mode)) {
+            if (unlinkat(parent_fd, entry->d_name, 0) != 0) result = 1;
+            continue;
+        }
+
+        int flags = O_RDONLY | O_DIRECTORY;
+        #ifdef O_NOFOLLOW
+            flags |= O_NOFOLLOW;
+        #endif
+        int child_fd = openat(parent_fd, entry->d_name, flags);
+        struct stat opened;
+        if (child_fd < 0 || fstat(child_fd, &opened) != 0 ||
+            opened.st_dev != expected.st_dev || opened.st_ino != expected.st_ino) {
+            if (child_fd >= 0) close(child_fd);
+            result = 1;
+            continue;
+        }
+        if (__os_remove_directory_fd__(child_fd) != 0 ||
+            unlinkat(parent_fd, entry->d_name, AT_REMOVEDIR) != 0) result = 1;
+    }
+    if (closedir(directory) != 0) result = 1;
+    return result;
+}
 #endif
 
 
 int os_remove(char *path) {
     if (!path || !path[0]) return 1;
-
     char base[4096];
     int len = snprintf(base, sizeof(base), "%s", path);
     if (len < 0 || len >= (int)sizeof(base)) return 1;
-
     int self = 1;
+
     if (len >= 2 && base[len - 1] == '.' && (base[len - 2] == '/' || base[len - 2] == '\\')) {
         base[len - 2] = '\0';
         self = 0;
@@ -996,32 +826,25 @@ int os_remove(char *path) {
     #if defined(__OS_UNIX__)
         struct stat expected;
         if (lstat(base, &expected) != 0) return 1;
+        if (S_ISLNK(expected.st_mode)) return self ? remove(base) : 1;
         if (!S_ISDIR(expected.st_mode)) return self ? remove(base) : 1;
 
         int flags = O_RDONLY | O_DIRECTORY;
-
         #ifdef O_NOFOLLOW
-            flags = flags | O_NOFOLLOW;
+            flags |= O_NOFOLLOW;
         #endif
-
         int directory_fd = open(base, flags);
         struct stat opened;
-        if (directory_fd < 0 || fstat(directory_fd, &opened) != 0 || opened.st_dev != expected.st_dev || opened.st_ino != expected.st_ino) {
+        if (directory_fd < 0 || fstat(directory_fd, &opened) != 0 ||
+            opened.st_dev != expected.st_dev || opened.st_ino != expected.st_ino) {
             if (directory_fd >= 0) close(directory_fd);
             return 1;
         }
         int result = __os_remove_directory_fd__(directory_fd);
         if (self) {
             struct stat current;
-            if (
-                lstat(base, &current) != 0
-                ||
-                current.st_dev != opened.st_dev
-                ||
-                current.st_ino != opened.st_ino
-                ||
-                remove(base) != 0
-            ) result = 1;
+            if (lstat(base, &current) != 0 || current.st_dev != opened.st_dev ||
+                current.st_ino != opened.st_ino || remove(base) != 0) result = 1;
         }
         return result;
     #elif defined(__OS_WINDOWS__)
@@ -1029,37 +852,105 @@ int os_remove(char *path) {
         DWORD base_attrs = GetFileAttributesA(base);
         if (base_attrs == INVALID_FILE_ATTRIBUTES) return 1;
         if (!(base_attrs & FILE_ATTRIBUTE_DIRECTORY)) return remove(base);
-        if (base_attrs & FILE_ATTRIBUTE_REPARSE_POINT) return self ? (RemoveDirectoryA(base) ? 0 : 1) : 0;
+        if (base_attrs & FILE_ATTRIBUTE_REPARSE_POINT) {
+            return self ? (RemoveDirectoryA(base) ? 0 : 1) : 0;
+        }
 
-        WIN32_FIND_DATAA entry;
+        WIN32_FIND_DATAA fd;
         int pattern_length = snprintf(sub, sizeof(sub), "%s\\*", base);
         if (pattern_length < 0 || pattern_length >= (int)sizeof(sub)) return 1;
-        HANDLE directory = FindFirstFileA(sub, &entry);
-        if (directory == INVALID_HANDLE_VALUE) return 1;
-
+        HANDLE h = FindFirstFileA(sub, &fd);
+        if (h == INVALID_HANDLE_VALUE) return 1;
         int result = 0;
         do {
-            const char *name = entry.cFileName;
-            if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) continue;
-
-            int length = snprintf(sub, sizeof(sub), "%s\\%s", base, name);
-            if (length < 0 || length >= (int)sizeof(sub)) {
-                result = 1;
-                continue;
+            if (strcmp(fd.cFileName, ".") && strcmp(fd.cFileName, "..")) {
+                int n = snprintf(sub, sizeof(sub), "%s\\%s", base, fd.cFileName);
+                if (n < 0 || n >= (int)sizeof(sub)) {
+                    result = 1;
+                    continue;
+                }
+                if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                    int status = (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) ?
+                        (RemoveDirectoryA(sub) ? 0 : 1) : os_remove(sub);
+                    if (status != 0) result = 1;
+                } else if (remove(sub) != 0) result = 1;
             }
-
-            int status;
-            if (!(entry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) status = remove(sub);
-            else if (entry.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) status = RemoveDirectoryA(sub) ? 0 : 1;
-            else status = os_remove(sub);
-            if (status != 0) result = 1;
-        } while (FindNextFileA(directory, &entry));
-
+        } while (FindNextFileA(h, &fd));
         if (GetLastError() != ERROR_NO_MORE_FILES) result = 1;
-        if (!FindClose(directory)) result = 1;
+        if (!FindClose(h)) result = 1;
         if (self && !RemoveDirectoryA(base)) result = 1;
         return result;
     #endif
 
     return 1;
+}
+
+int os_file_lock(FILE *file) {
+    if (!file) return 1;
+    #if defined(__OS_UNIX__)
+        return flock(fileno(file), LOCK_EX | LOCK_NB) == 0 ? 0 : 1;
+    #elif defined(__OS_WINDOWS__)
+        HANDLE handle = (HANDLE)_get_osfhandle(_fileno(file));
+        if (handle == INVALID_HANDLE_VALUE) return 1;
+        OVERLAPPED overlap = {0};
+        return LockFileEx(handle, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            0, MAXDWORD, MAXDWORD, &overlap) ? 0 : 1;
+    #endif
+}
+
+int os_file_sync(FILE *file) {
+    if (!file || fflush(file) != 0) return 1;
+    #if defined(__OS_UNIX__)
+        return fsync(fileno(file)) == 0 ? 0 : 1;
+    #elif defined(__OS_WINDOWS__)
+        intptr_t descriptor = _get_osfhandle(_fileno(file));
+        if (descriptor == -1) return 1;
+        return FlushFileBuffers((HANDLE)descriptor) ? 0 : 1;
+    #endif
+}
+
+
+int os_file_lock_wait(FILE *file) {
+    if (!file) return 1;
+    #if defined(__OS_UNIX__)
+        return flock(fileno(file), LOCK_EX) == 0 ? 0 : 1;
+    #elif defined(__OS_WINDOWS__)
+        HANDLE handle = (HANDLE)_get_osfhandle(_fileno(file));
+        if (handle == INVALID_HANDLE_VALUE) return 1;
+        OVERLAPPED overlap = {0};
+        return LockFileEx(handle, LOCKFILE_EXCLUSIVE_LOCK, 0, MAXDWORD, MAXDWORD, &overlap) ? 0 : 1;
+    #endif
+}
+
+
+void os_file_unlock(FILE *file) {
+    if (!file) return;
+    #if defined(__OS_UNIX__)
+        flock(fileno(file), LOCK_UN);
+    #elif defined(__OS_WINDOWS__)
+        HANDLE handle = (HANDLE)_get_osfhandle(_fileno(file));
+        if (handle == INVALID_HANDLE_VALUE) return;
+        OVERLAPPED overlap = {0};
+        UnlockFileEx(handle, 0, MAXDWORD, MAXDWORD, &overlap);
+    #endif
+}
+
+
+int os_rename_replace(const char *source, const char *destination) {
+    if (!source || !destination) return 1;
+    #if defined(__OS_UNIX__)
+        return rename(source, destination);
+    #elif defined(__OS_WINDOWS__)
+        return MoveFileExA(source, destination, MOVEFILE_REPLACE_EXISTING) ? 0 : 1;
+    #endif
+}
+
+
+int os_hardlink(const char *source, const char *destination) {
+    if (!source || !destination) return 1;
+    #if defined(__OS_UNIX__)
+        return link(source, destination) == 0 ? 0 : 1;
+    #elif defined(__OS_WINDOWS__)
+        return CreateHardLinkA(destination, source, NULL) ? 0 : 1;
+    #endif
 }

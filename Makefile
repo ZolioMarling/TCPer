@@ -4,7 +4,6 @@ CC := gcc
 TARGET := tcper
 
 RWILDCARD = $(foreach d,$(wildcard $1*),$(call RWILDCARD,$d/,$2) $(filter $(subst *,%,$2),$d))
-# SOURCES := $(filter-out ./tests/%,$(call RWILDCARD, ./, %.c))
 SOURCES := $(call RWILDCARD, ./, %.c)
 BASE_OBJECTS := $(SOURCES:.c=.o)
 
@@ -14,7 +13,7 @@ RELEASE_FLAGS := -O3 -pipe -fPIC
 ifeq ($(OS),Windows_NT)
 TARGET := $(TARGET).exe
 RELEASE_FLAGS := -s -flto ${RELEASE_FLAGS}
-LINKER_LIBRARIES := -lws2_32 -ladvapi32 -lbcrypt -lm
+LINKER_LIBRARIES := -lws2_32 -ladvapi32 -lm
 REMOVE = cmd /c del /q
 else
 TARGET := $(TARGET)

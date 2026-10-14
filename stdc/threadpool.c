@@ -1,466 +1,473 @@
 #include "threadpool.h"
 
 
-#if defined(_MSC_VER) && !defined(__clang__)
-    static __declspec(thread) ThreadPool *threadpool_current;
-#else
-    static _Thread_local ThreadPool *threadpool_current;
-#endif
+#include <limits.h>
+#include <stdint.h>
+#include <stdlib.h>
 
 
-static int __threadpool_worker__(void *args);
-static void __threadpool_lock__(ThreadPool *pool);
-static void __threadpool_unlock__(ThreadPool *pool);
-static int __threadpool_condition_init__(_PoolCondition *condition);
-static void __threadpool_condition_destroy__(_PoolCondition *condition);
-static void __threadpool_condition_wait__(ThreadPool *pool, _PoolCondition *condition);
-static void __threadpool_condition_signal__(_PoolCondition *condition);
-static void __threadpool_condition_broadcast__(_PoolCondition *condition);
-static void __threadpool_join__(Thread *thread);
-static void __threadpool_free__(ThreadPool *pool);
-static void __threadpool_free_initialized__(ThreadPool *pool);
-static void __threadpool_count__(uint64 *counter, usize count);
-static void __threadpool_signal_idle__(ThreadPool *pool);
-static void __threadpool_leave__(ThreadPool *pool);
-static void __threadpool_submit_leave__(ThreadPool *pool);
-static void __threadpool_broadcast_all__(ThreadPool *pool);
+typedef struct ThreadTask {
+    void (*func)(void *args);
+    void *args;
+    void (*cleanup)(void *args);
+} ThreadTask;
 
 
-// All synchronization objects survive until the final owned reference.
 struct ThreadPool {
-    Mutex lock;
-    _PoolCondition notify;
-    _PoolCondition not_full;
-    _PoolCondition all_idle;
-    _PoolCondition api_idle;
+    /* This lock remains valid until the final retained reference is released. */
+    Mutex lifecycle_lock;
+    ThreadCondition api_idle;
     unsigned int references;
     unsigned int api_users;
-    unsigned int pending_submissions;
-    unsigned int waiting_submitters;
-    unsigned int waiting_batches;
-    unsigned int waiting_clients;
-    int waiting_workers;
-    int shutdown;
+    int closing;
     int destroyed;
+    int destroy_active;
+
+    Mutex queue_lock;
+    ThreadCondition notify;
+    ThreadCondition not_full;
+    ThreadCondition all_idle;
+    unsigned int pending_submissions;
+    int shutdown;
     int n_workers;
+    int n_joined_workers;
     int n_working;
     Thread *threads;
-    ThreadPoolTask *queue;
-    usize queue_length;
-    usize queue_capacity;
-    usize queue_head;
-    usize queue_tail;
-    usize queue_peak;
-    uint64 accepted;
-    uint64 completed;
-    uint64 discarded;
+    size_t queue_length;
+    size_t queue_capacity;
+    ThreadTask *queue;
+    size_t queue_head;
+    size_t queue_tail;
 };
 
 
-ThreadPool *threadpool_create(int n_workers, int queue_capacity) {
-    if (n_workers <= 0 || queue_capacity <= 0) return NULL;
-    if (
-        (usize)queue_capacity > SIZE_MAX / sizeof(ThreadPoolTask)
-        ||
-        (usize)n_workers > SIZE_MAX / sizeof(Thread)
-    ) return NULL;
+static int threadpool_worker(void *args);
 
-    ThreadPool *pool = calloc(1, sizeof(*pool));
-    if (!pool) return NULL;
 
-    pool->queue = calloc((usize)queue_capacity, sizeof(*pool->queue));
-    pool->threads = calloc((usize)n_workers, sizeof(*pool->threads));
-    if (!pool->queue || !pool->threads) {
-        __threadpool_free__(pool);
-        return NULL;
-    }
-
-    pool->references = 1;
-    pool->n_workers = n_workers;
-    pool->queue_capacity = (usize)queue_capacity;
-
-    if (mutex_create(&pool->lock, 1) != 0) goto fail_alloc;
-    if (__threadpool_condition_init__(&pool->notify) != 0) goto fail_lock;
-    if (__threadpool_condition_init__(&pool->not_full) != 0) goto fail_notify;
-    if (__threadpool_condition_init__(&pool->all_idle) != 0) goto fail_not_full;
-    if (__threadpool_condition_init__(&pool->api_idle) != 0) goto fail_all_idle;
-
-    int n;
-    for (n = 0; n < n_workers; n++) {
-        if (thread_create(&pool->threads[n], __threadpool_worker__, pool) != 0) {
-            __threadpool_lock__(pool);
-            pool->shutdown = 1;
-            __threadpool_condition_broadcast__(&pool->notify);
-            __threadpool_unlock__(pool);
-            while (n > 0) __threadpool_join__(&pool->threads[--n]);
-            __threadpool_free_initialized__(pool);
-            return NULL;
-        }
-    }
-    return pool;
-
-    fail_all_idle: __threadpool_condition_destroy__(&pool->all_idle);
-    fail_not_full: __threadpool_condition_destroy__(&pool->not_full);
-    fail_notify: __threadpool_condition_destroy__(&pool->notify);
-    fail_lock: mutex_destroy(&pool->lock);
-    fail_alloc: __threadpool_free__(pool);
-
-    return NULL;
+/* Private synchronization failures leave lock ownership indeterminate. */
+static _Noreturn void threadpool_sync_failure(void) {
+    abort();
 }
 
 
-int threadpool_add(ThreadPool *pool, void (*func)(void *args), void *args, int block, void (*cleanup)(void *args)) {
-    ThreadPoolTask task = {func, args, cleanup};
-    return threadpool_add_batch(pool, &task, 1, block);
+static void threadpool_lock(Mutex *mutex) {
+    if (mutex_lock(mutex) != 0) threadpool_sync_failure();
 }
 
 
-int threadpool_add_batch(ThreadPool *pool, ThreadPoolTask *tasks, usize count, int block) {
-    if (!pool || !tasks || count == 0) return 1;
-
-    __threadpool_lock__(pool);
-
-    if (pool->shutdown || pool->api_users == UINT_MAX || count > pool->queue_capacity) {
-        __threadpool_unlock__(pool);
-        return 1;
-    }
-
-    for (usize i = 0; i < count; i++) {
-        if (!tasks[i].func) {
-            __threadpool_unlock__(pool);
-            return 1;
-        }
-    }
-
-    pool->api_users++;
-    pool->pending_submissions++;
-
-    while (count > pool->queue_capacity - pool->queue_length && !pool->shutdown) {
-        if (!block || threadpool_current == pool) {
-            __threadpool_submit_leave__(pool);
-            return 2;
-        }
-        pool->waiting_submitters++;
-        if (count > 1) pool->waiting_batches++;
-        __threadpool_condition_wait__(pool, &pool->not_full);
-        if (count > 1) pool->waiting_batches--;
-        pool->waiting_submitters--;
-    }
-
-    if (pool->shutdown) {
-        __threadpool_submit_leave__(pool);
-        return 1;
-    }
-
-    for (usize i = 0; i < count; i++) {
-        pool->queue[pool->queue_tail] = tasks[i];
-        if (++pool->queue_tail == pool->queue_capacity) pool->queue_tail = 0;
-    }
-
-    pool->queue_length = pool->queue_length + count;
-    if (pool->queue_length > pool->queue_peak) pool->queue_peak = pool->queue_length;
-    __threadpool_count__(&pool->accepted, count);
-
-    if (pool->waiting_workers) {
-        if (count >= (usize)pool->waiting_workers && count > 1) __threadpool_condition_broadcast__(&pool->notify);
-        else for (usize i = 0; i < count; i++) __threadpool_condition_signal__(&pool->notify);
-    }
-
-    __threadpool_submit_leave__(pool);
-    return 0;
+static void threadpool_unlock(Mutex *mutex) {
+    if (mutex_unlock(mutex) != 0) threadpool_sync_failure();
 }
 
 
-int threadpool_wait(ThreadPool *pool) {
-    if (!pool || threadpool_current == pool) return 1;
-
-    __threadpool_lock__(pool);
-
-    if (pool->shutdown || pool->api_users == UINT_MAX) {
-        __threadpool_unlock__(pool);
-        return 1;
-    }
-
-    pool->api_users++;
-    pool->waiting_clients++;
-
-    while (
-        !pool->shutdown
-        &&
-        (pool->queue_length > 0 || pool->n_working > 0 || pool->pending_submissions > 0)
-    ) __threadpool_condition_wait__(pool, &pool->all_idle);
-
-    pool->waiting_clients--;
-    int status = pool->shutdown ? 1 : 0;
-
-    __threadpool_leave__(pool);
-    return status;
+static void threadpool_condition_wait(ThreadCondition *condition, Mutex *mutex) {
+    if (condition_wait(condition, mutex) != 0) threadpool_sync_failure();
 }
 
 
-int threadpool_stats(ThreadPool *pool, _ThreadPoolStats *stats) {
-    if (!pool || !stats) return 1;
-    __threadpool_lock__(pool);
-    stats->workers = pool->n_workers;
-    stats->active_tasks = pool->n_working;
-    stats->idle_workers = pool->waiting_workers;
-    stats->waiting_submitters = pool->waiting_submitters;
-    stats->waiting_clients = pool->waiting_clients;
-    stats->pending_submissions = pool->pending_submissions;
-    stats->queued_tasks = pool->queue_length;
-    stats->queue_capacity = pool->queue_capacity;
-    stats->queue_peak = pool->queue_peak;
-    stats->accepted = pool->accepted;
-    stats->completed = pool->completed;
-    stats->discarded = pool->discarded;
-    stats->closing = pool->shutdown;
-    stats->destroyed = pool->destroyed;
-    __threadpool_unlock__(pool);
-    return 0;
+static void threadpool_condition_signal(ThreadCondition *condition) {
+    if (condition_signal(condition) != 0) threadpool_sync_failure();
 }
 
 
-int threadpool_destroy(ThreadPool *pool, int safe_exit) {
-    return __threadpool_destroy__(pool, safe_exit, NULL);
+static void threadpool_condition_broadcast(ThreadCondition *condition) {
+    if (condition_broadcast(condition) != 0) threadpool_sync_failure();
 }
 
 
-int __threadpool_destroy__(ThreadPool *pool, int safe_exit, usize *discarded_tasks) {
-    if (discarded_tasks) *discarded_tasks = 0;
-    if (!pool || threadpool_current == pool) return 1;
+static void threadpool_join(Thread *thread) {
+    int worker_status;
 
-    __threadpool_lock__(pool);
-    if (pool->shutdown) {
-        __threadpool_unlock__(pool);
-        return 1;
-    }
-    pool->shutdown = 1;
-
-    usize discarded_head = 0;
-    usize discarded_count = 0;
-
-    if (!safe_exit) {
-        discarded_head = pool->queue_head;
-        discarded_count = pool->queue_length;
-        pool->queue_length = 0;
-        __threadpool_count__(&pool->discarded, discarded_count);
-    }
-
-    if (discarded_tasks) *discarded_tasks = discarded_count;
-
-    __threadpool_broadcast_all__(pool);
-    __threadpool_unlock__(pool);
-
-    for (usize i = 0; i < discarded_count; i++) {
-        ThreadPoolTask *task = &pool->queue[discarded_head];
-        if (task->cleanup) task->cleanup(task->args);
-        if (++discarded_head == pool->queue_capacity) discarded_head = 0;
-    }
-
-    __threadpool_lock__(pool);
-    while (pool->api_users != 0) __threadpool_condition_wait__(pool, &pool->api_idle);
-    __threadpool_unlock__(pool);
-
-    for (int worker = 0; worker < pool->n_workers; worker++) __threadpool_join__(&pool->threads[worker]);
-
-    __threadpool_lock__(pool);
-    free(pool->threads);
-    pool->threads = NULL;
-    free(pool->queue);
-    pool->queue = NULL;
-    pool->destroyed = 1;
-    __threadpool_unlock__(pool);
-
-    return __threadpool_release__(pool);
+    if (thread_join(thread, &worker_status) != 0 || worker_status != 0)
+        threadpool_sync_failure();
 }
 
 
-int __threadpool_retain__(ThreadPool *pool) {
-    if (!pool) return 1;
-    __threadpool_lock__(pool);
-    if (pool->shutdown || pool->references == UINT_MAX) {
-        __threadpool_unlock__(pool);
-        return 1;
-    }
-    pool->references++;
-    __threadpool_unlock__(pool);
-    return 0;
-}
-
-
-int __threadpool_release__(ThreadPool *pool) {
-    if (!pool) return 1;
-    __threadpool_lock__(pool);
-    if (pool->references == 1 && !pool->destroyed) {
-        __threadpool_unlock__(pool);
-        return 1;
-    }
-    int free_pool = --pool->references == 0;
-    __threadpool_unlock__(pool);
-    if (free_pool) __threadpool_free_initialized__(pool);
-    return 0;
-}
-
-
-static void __threadpool_lock__(ThreadPool *pool) {
-    if (mutex_lock(&pool->lock) != 0) abort();
-}
-
-
-static void __threadpool_unlock__(ThreadPool *pool) {
-    if (mutex_unlock(&pool->lock) != 0) abort();
-}
-
-
-static int __threadpool_condition_init__(_PoolCondition *condition) {
-    #if defined(__OS_WINDOWS__)
-        InitializeConditionVariable(condition);
-        return 0;
-    #else
-        return condition_init(condition);
-    #endif
-}
-
-
-static void __threadpool_condition_destroy__(_PoolCondition *condition) {
-    #if defined(__OS_WINDOWS__)
-        (void)condition;
-    #else
-        condition_destroy(condition);
-    #endif
-}
-
-
-static void __threadpool_condition_wait__(ThreadPool *pool, _PoolCondition *condition) {
-    #if defined(__OS_WINDOWS__)
-        // The pool always holds this nonrecursive critical section exactly once.
-        pool->lock.status = 0;
-        BOOL success = SleepConditionVariableCS(condition, &pool->lock.cs, INFINITE);
-        pool->lock.status = 1;
-        if (!success) abort();
-    #else
-        if (condition_wait(condition, &pool->lock) != 0) abort();
-    #endif
-}
-
-
-static void __threadpool_condition_signal__(_PoolCondition *condition) {
-    #if defined(__OS_WINDOWS__)
-        WakeConditionVariable(condition);
-    #else
-        if (condition_signal(condition) != 0) abort();
-    #endif
-}
-
-
-static void __threadpool_condition_broadcast__(_PoolCondition *condition) {
-    #if defined(__OS_WINDOWS__)
-        WakeAllConditionVariable(condition);
-    #else
-        if (condition_broadcast(condition) != 0) abort();
-    #endif
-}
-
-
-static void __threadpool_join__(Thread *thread) {
-    int status;
-    if (thread_join(thread, &status) != 0 || status != 0) abort();
-}
-
-
-static void __threadpool_free__(ThreadPool *pool) {
+static void threadpool_free(ThreadPool *pool) {
+    if (!pool) return;
     free(pool->threads);
     free(pool->queue);
     free(pool);
 }
 
 
-static void __threadpool_free_initialized__(ThreadPool *pool) {
-    __threadpool_condition_destroy__(&pool->api_idle);
-    __threadpool_condition_destroy__(&pool->all_idle);
-    __threadpool_condition_destroy__(&pool->not_full);
-    __threadpool_condition_destroy__(&pool->notify);
-    mutex_destroy(&pool->lock);
-    __threadpool_free__(pool);
+/* lifecycle_lock must be held. */
+static void threadpool_cancel_api_user_locked(ThreadPool *pool) {
+    if (pool->api_users > 0) pool->api_users--;
+    threadpool_condition_broadcast(&pool->api_idle);
 }
 
 
-static void __threadpool_count__(uint64 *counter, usize count) {
-    *counter = count > UINT64_MAX - *counter ? UINT64_MAX : *counter + count;
+/* Entering a wait keeps queue_lock held, establishing its submission boundary. */
+static int threadpool_wait_enter(ThreadPool *pool) {
+    if (!pool) return 1;
+    threadpool_lock(&pool->lifecycle_lock);
+
+    if (pool->closing || pool->destroyed || pool->api_users == UINT_MAX) {
+        threadpool_unlock(&pool->lifecycle_lock);
+        return 1;
+    }
+    pool->api_users++;
+
+    threadpool_lock(&pool->queue_lock);
+    threadpool_unlock(&pool->lifecycle_lock);
+    return 0;
 }
 
 
-static void __threadpool_signal_idle__(ThreadPool *pool) {
-    if (
-        pool->waiting_clients
-        &&
-        pool->queue_length == 0
-        &&
-        pool->n_working == 0
-        &&
-        pool->pending_submissions == 0
-    ) __threadpool_condition_broadcast__(&pool->all_idle);
+static void threadpool_leave(ThreadPool *pool) {
+    if (!pool) return;
+    threadpool_lock(&pool->lifecycle_lock);
+
+    threadpool_cancel_api_user_locked(pool);
+    threadpool_unlock(&pool->lifecycle_lock);
 }
 
 
-static void __threadpool_leave__(ThreadPool *pool) {
+/* Entering a submission holds queue_lock, which makes pending_submissions visible to waiters. */
+static int threadpool_submit_enter(ThreadPool *pool) {
+    if (!pool) return 1;
+    threadpool_lock(&pool->lifecycle_lock);
+
+    if (pool->closing || pool->destroyed || pool->api_users == UINT_MAX) {
+        threadpool_unlock(&pool->lifecycle_lock);
+        return 1;
+    }
+    pool->api_users++;
+
+    threadpool_lock(&pool->queue_lock);
+    pool->pending_submissions++;
+    threadpool_unlock(&pool->lifecycle_lock);
+    return 0;
+}
+
+
+static void threadpool_submit_leave_locked(ThreadPool *pool) {
+    if (pool->pending_submissions > 0) pool->pending_submissions--;
+    if (pool->pending_submissions == 0) threadpool_condition_broadcast(&pool->all_idle);
+    threadpool_unlock(&pool->queue_lock);
+    threadpool_leave(pool);
+}
+
+
+static void threadpool_broadcast_all(ThreadPool *pool) {
+    threadpool_condition_broadcast(&pool->notify);
+    threadpool_condition_broadcast(&pool->not_full);
+    threadpool_condition_broadcast(&pool->all_idle);
+}
+
+
+static int threadpool_destroy_enter(ThreadPool *pool) {
+    if (!pool) return 1;
+    threadpool_lock(&pool->lifecycle_lock);
+
+    if (pool->destroy_active || pool->destroyed || pool->api_users == UINT_MAX) {
+        threadpool_unlock(&pool->lifecycle_lock);
+        return 1;
+    }
+    pool->closing = 1;
+    pool->destroy_active = 1;
+    pool->api_users++;
+    threadpool_unlock(&pool->lifecycle_lock);
+    return 0;
+}
+
+
+static int threadpool_is_worker(ThreadPool *pool) {
+    int i;
+
+    if (!pool) return 0;
+#if defined(__OS_UNIX__)
+    {
+        pthread_t self = pthread_self();
+        for (i = 0; i < pool->n_workers; i++) {
+            if (pthread_equal(self, pool->threads[i])) return 1;
+        }
+    }
+#elif defined(__OS_WINDOWS__)
+    {
+        DWORD self = GetCurrentThreadId();
+        for (i = 0; i < pool->n_workers; i++) {
+            if (GetThreadId(pool->threads[i]) == self) return 1;
+        }
+    }
+#else
+    (void)i;
+#endif
+    return 0;
+}
+
+
+int threadpool_retain(ThreadPool *pool) {
+    if (!pool) return 1;
+    threadpool_lock(&pool->lifecycle_lock);
+
+    if (pool->closing || pool->destroyed || pool->references == 0 ||
+        pool->references == UINT_MAX) {
+        threadpool_unlock(&pool->lifecycle_lock);
+        return 1;
+    }
+    pool->references++;
+    threadpool_unlock(&pool->lifecycle_lock);
+    return 0;
+}
+
+
+int threadpool_release(ThreadPool *pool) {
+    int free_pool = 0;
+
+    if (!pool) return 1;
+    threadpool_lock(&pool->lifecycle_lock);
+
+    if (pool->references == 0 || (pool->references == 1 && !pool->destroyed)) {
+        threadpool_unlock(&pool->lifecycle_lock);
+        return 1;
+    }
+    pool->references--;
+    if (pool->references == 0) free_pool = 1;
+    threadpool_unlock(&pool->lifecycle_lock);
+
+    if (free_pool) {
+        condition_destroy(&pool->api_idle);
+        mutex_destroy(&pool->lifecycle_lock);
+        threadpool_free(pool);
+    }
+    return 0;
+}
+
+
+ThreadPool *threadpool_create(int n_workers, int queue_capacity) {
+    int i;
+    ThreadPool *pool;
+
+    if (n_workers <= 0 || queue_capacity <= 0) return NULL;
+    if ((size_t)queue_capacity > SIZE_MAX / sizeof(ThreadTask) ||
+        (size_t)n_workers > SIZE_MAX / sizeof(Thread)) return NULL;
+
+    pool = calloc(1, sizeof(*pool));
+    if (!pool) return NULL;
+
+    pool->queue = calloc((size_t)queue_capacity, sizeof(*pool->queue));
+    pool->threads = calloc((size_t)n_workers, sizeof(*pool->threads));
+    if (!pool->queue || !pool->threads) {
+        threadpool_free(pool);
+        return NULL;
+    }
+
+    pool->references = 1;
+    pool->n_workers = n_workers;
+    pool->queue_capacity = (size_t)queue_capacity;
+
+    if (mutex_create(&pool->lifecycle_lock, 1) != 0) {
+        threadpool_free(pool);
+        return NULL;
+    }
+    if (condition_init(&pool->api_idle) != 0) {
+        mutex_destroy(&pool->lifecycle_lock);
+        threadpool_free(pool);
+        return NULL;
+    }
+    if (mutex_create(&pool->queue_lock, 1) != 0) {
+        condition_destroy(&pool->api_idle);
+        mutex_destroy(&pool->lifecycle_lock);
+        threadpool_free(pool);
+        return NULL;
+    }
+    if (condition_init(&pool->all_idle) != 0) {
+        mutex_destroy(&pool->queue_lock);
+        condition_destroy(&pool->api_idle);
+        mutex_destroy(&pool->lifecycle_lock);
+        threadpool_free(pool);
+        return NULL;
+    }
+    if (condition_init(&pool->notify) != 0) {
+        condition_destroy(&pool->all_idle);
+        mutex_destroy(&pool->queue_lock);
+        condition_destroy(&pool->api_idle);
+        mutex_destroy(&pool->lifecycle_lock);
+        threadpool_free(pool);
+        return NULL;
+    }
+    if (condition_init(&pool->not_full) != 0) {
+        condition_destroy(&pool->notify);
+        condition_destroy(&pool->all_idle);
+        mutex_destroy(&pool->queue_lock);
+        condition_destroy(&pool->api_idle);
+        mutex_destroy(&pool->lifecycle_lock);
+        threadpool_free(pool);
+        return NULL;
+    }
+
+    for (i = 0; i < n_workers; i++) {
+        if (thread_create(&pool->threads[i], threadpool_worker, pool) != 0) {
+            threadpool_lock(&pool->queue_lock);
+            pool->shutdown = 1;
+            pool->n_workers = i;
+            threadpool_broadcast_all(pool);
+            threadpool_unlock(&pool->queue_lock);
+
+            while (i > 0) {
+                i--;
+                threadpool_join(&pool->threads[i]);
+            }
+            condition_destroy(&pool->not_full);
+            condition_destroy(&pool->notify);
+            condition_destroy(&pool->all_idle);
+            mutex_destroy(&pool->queue_lock);
+            condition_destroy(&pool->api_idle);
+            mutex_destroy(&pool->lifecycle_lock);
+            threadpool_free(pool);
+            return NULL;
+        }
+    }
+    return pool;
+}
+
+
+int threadpool_add(ThreadPool *pool, void (*func)(void *args), void *args,
+                   int block, void (*cleanup)(void *args)) {
+    int can_block;
+
+    if (!func || threadpool_submit_enter(pool) != 0) return 1;
+
+    can_block = block && !threadpool_is_worker(pool);
+    while (pool->queue_length == pool->queue_capacity && !pool->shutdown) {
+        if (!can_block) {
+            threadpool_submit_leave_locked(pool);
+            return 2;
+        }
+        threadpool_condition_wait(&pool->not_full, &pool->queue_lock);
+    }
+    if (pool->shutdown) {
+        threadpool_submit_leave_locked(pool);
+        return 1;
+    }
+
+    pool->queue[pool->queue_tail].func = func;
+    pool->queue[pool->queue_tail].args = args;
+    pool->queue[pool->queue_tail].cleanup = cleanup;
+    pool->queue_tail++;
+    if (pool->queue_tail == pool->queue_capacity) pool->queue_tail = 0;
+    pool->queue_length++;
+
+    threadpool_condition_signal(&pool->notify);
+    threadpool_submit_leave_locked(pool);
+    return 0;
+}
+
+
+int threadpool_wait(ThreadPool *pool) {
+    int status;
+
+    if (threadpool_is_worker(pool) || threadpool_wait_enter(pool) != 0) return 1;
+
+    while (pool->queue_length > 0 || pool->n_working > 0 ||
+           pool->pending_submissions > 0) {
+        if (pool->shutdown) {
+            threadpool_unlock(&pool->queue_lock);
+            threadpool_leave(pool);
+            return 1;
+        }
+        threadpool_condition_wait(&pool->all_idle, &pool->queue_lock);
+    }
+    status = pool->shutdown ? 1 : 0;
+    threadpool_unlock(&pool->queue_lock);
+    threadpool_leave(pool);
+    return status;
+}
+
+
+int threadpool_destroy_ex(ThreadPool *pool, int safe_exit, size_t *discarded_tasks) {
+    size_t discarded_count = 0;
+    size_t discarded_head = 0;
+    size_t i;
+
+    if (discarded_tasks) *discarded_tasks = 0;
+    if (!pool || threadpool_is_worker(pool) || threadpool_destroy_enter(pool) != 0) return 1;
+
+    threadpool_lock(&pool->queue_lock);
+    pool->shutdown = 1;
+    if (!safe_exit && pool->queue_length > 0) {
+        discarded_head = pool->queue_head;
+        discarded_count = pool->queue_length;
+        pool->queue_length = 0;
+        pool->queue_head = 0;
+        pool->queue_tail = 0;
+    }
+    if (discarded_tasks) *discarded_tasks = discarded_count;
+    threadpool_broadcast_all(pool);
+    threadpool_unlock(&pool->queue_lock);
+
+    /* Cleanup is allowed to be slow or reentrant, so it never runs under queue_lock. */
+    for (i = 0; i < discarded_count; i++) {
+        ThreadTask *task = &pool->queue[discarded_head];
+
+        if (task->cleanup) task->cleanup(task->args);
+        discarded_head++;
+        if (discarded_head == pool->queue_capacity) discarded_head = 0;
+    }
+
+    threadpool_lock(&pool->lifecycle_lock);
+    while (pool->api_users != 1) {
+        threadpool_condition_wait(&pool->api_idle, &pool->lifecycle_lock);
+    }
+    threadpool_unlock(&pool->lifecycle_lock);
+
+    while (pool->n_joined_workers < pool->n_workers) {
+        threadpool_join(&pool->threads[pool->n_joined_workers]);
+        pool->n_joined_workers++;
+    }
+
+    threadpool_lock(&pool->lifecycle_lock);
+    pool->destroyed = 1;
+    pool->destroy_active = 0;
     pool->api_users--;
-    if (pool->shutdown && pool->api_users == 0) __threadpool_condition_signal__(&pool->api_idle);
-    __threadpool_unlock__(pool);
+    threadpool_condition_broadcast(&pool->api_idle);
+    threadpool_unlock(&pool->lifecycle_lock);
+
+    condition_destroy(&pool->not_full);
+    condition_destroy(&pool->notify);
+    condition_destroy(&pool->all_idle);
+    mutex_destroy(&pool->queue_lock);
+    return threadpool_release(pool);
 }
 
 
-static void __threadpool_submit_leave__(ThreadPool *pool) {
-    pool->pending_submissions--;
-    __threadpool_signal_idle__(pool);
-    __threadpool_leave__(pool);
+int threadpool_destroy(ThreadPool *pool, int safe_exit) {
+    return threadpool_destroy_ex(pool, safe_exit, NULL);
 }
 
 
-static void __threadpool_broadcast_all__(ThreadPool *pool) {
-    __threadpool_condition_broadcast__(&pool->notify);
-    __threadpool_condition_broadcast__(&pool->not_full);
-    __threadpool_condition_broadcast__(&pool->all_idle);
-}
+static int threadpool_worker(void *args) {
+    ThreadPool *pool = (ThreadPool *)args;
 
+    while (1) {
+        ThreadTask task;
 
-static int __threadpool_worker__(void *args) {
-    ThreadPool *pool = args;
-    threadpool_current = pool;
-
-    __threadpool_lock__(pool);
-
-    while (true) {
+        threadpool_lock(&pool->queue_lock);
         while (pool->queue_length == 0 && !pool->shutdown) {
-            pool->waiting_workers++;
-            __threadpool_condition_wait__(pool, &pool->notify);
-            pool->waiting_workers--;
+            threadpool_condition_wait(&pool->notify, &pool->queue_lock);
+        }
+        if (pool->shutdown && pool->queue_length == 0) {
+            threadpool_unlock(&pool->queue_lock);
+            return 0;
         }
 
-        if (pool->shutdown && pool->queue_length == 0) break;
-        ThreadPoolTask task = pool->queue[pool->queue_head];
-
-        if (++pool->queue_head == pool->queue_capacity) pool->queue_head = 0;
+        task = pool->queue[pool->queue_head];
+        pool->queue_head++;
+        if (pool->queue_head == pool->queue_capacity) pool->queue_head = 0;
         pool->queue_length--;
-        if (pool->waiting_submitters) {
-            if (pool->waiting_batches) __threadpool_condition_broadcast__(&pool->not_full);
-            else __threadpool_condition_signal__(&pool->not_full);
-        }
-
+        threadpool_condition_signal(&pool->not_full);
         pool->n_working++;
-        __threadpool_unlock__(pool);
+        threadpool_unlock(&pool->queue_lock);
 
         task.func(task.args);
         if (task.cleanup) task.cleanup(task.args);
 
-        __threadpool_lock__(pool);
+        threadpool_lock(&pool->queue_lock);
         pool->n_working--;
-        __threadpool_count__(&pool->completed, 1);
-        __threadpool_signal_idle__(pool);
-        // Keep the mutex lock for the next dequeue to avoid a second acquisition.
+        if (pool->n_working == 0 && pool->queue_length == 0)
+            threadpool_condition_broadcast(&pool->all_idle);
+        threadpool_unlock(&pool->queue_lock);
     }
-
-    __threadpool_unlock__(pool);
-    threadpool_current = NULL;
-    return 0;
 }
